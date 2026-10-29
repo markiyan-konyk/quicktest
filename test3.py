@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+# Test 2: pot as a voltage divider (end -> 3.3 V, other end -> GND, wiper -> A0). No extra resistor.
+# Prints the pot reading ~10x per second. Hold the knob still to see the noise. Ctrl+C to stop.
+import time, statistics
+from collections import deque
+
+try:
+    from smbus2 import SMBus
+except ImportError:
+    from smbus import SMBus
+
+ADDR = 0x48  # ADS1115 with ADDR left unconnected
+VDD = 3.3  # Pi 3.3 V rail powering the pot and the ADS1115
+ANGLE = 340.0  # RH24PC electrical travel in degrees
+
+
+def read_a0(bus):
+    # Config 0xC383: start conversion, AIN0 vs GND, +/-4.096 V range, single-shot, 128 SPS
+    bus.write_i2c_block_data(ADDR, 0x01, [0xC3, 0x83])
+    time.sleep(0.009)
+    while not bus.read_i2c_block_data(ADDR, 0x01, 2)[0] & 0x80:
+        time.sleep(0.001)
+    hi, lo = bus.read_i2c_block_data(ADDR, 0x00, 2)
+    raw = (hi << 8) | lo
+    if raw >= 0x8000:
+        raw -= 0x10000
+    return raw * 4.096 / 32768
+
+
+bus = SMBus(1)
+history = deque(maxlen=50)
+last_print = 0.0
+try:
+    while True:
+        v = read_a0(bus)
+        angle = v / VDD * ANGLE  # wiper voltage is directly proportional to position
+        history.append(angle)
+        if time.monotonic() - last_print > 0.1:
+            last_print = time.monotonic()
+            noise = statistics.pstdev(history) if len(history) > 5 else 0.0
+            print(
+                f"\rA0 = {v:.4f} V   position = {v / VDD * 100:6.2f} %   angle = {angle:7.2f} deg"
+                f"   noise = {noise:.3f} deg rms   ",
+                end="",
+                flush=True,
+            )
+except KeyboardInterrupt:
+    print()
+finally:
+    bus.close()
