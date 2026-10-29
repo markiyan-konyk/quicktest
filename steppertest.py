@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# Sweep test: turn the Sangaboard's 4th (auxiliary) motor in small moves, read the pot
-# (3-wire circuit, A0) after each move, then save a graph of voltage vs motor steps.
-# Ctrl+C stops early and still saves the graph.
+# Sweep test: turn the Sangaboard's 4th (auxiliary) motor, read the pot (3-wire circuit, A0)
+# after every move, and record the exact step where the pot wraps around: the moment the
+# voltage comes back at the low end and starts rising again. The number of steps between two
+# of those moments is one full turn of the pot. Ctrl+C stops early and still saves everything.
 import time
 import serial
 import matplotlib
@@ -11,10 +12,13 @@ import matplotlib.pyplot as plt
 from smbus2 import SMBus
 
 PORT = "/dev/serial0"  # Pi's hardware serial port (GPIO14/15), where the Sangaboard listens
-STEPS_PER_MOVE = 1  # motor steps between readings (smaller = finer graph, slower sweep)
-TOTAL_STEPS = (
-    10000  # how far to turn in total; must be more than one full turn of the pot
-)
+TOTAL_STEPS = 100000  # how far to turn in total; a long test covers many pot turns
+COARSE_STEPS = 20  # steps per move while far from the limit (fast)
+FINE_STEPS = 1  # steps per move near the limit, so the wrap is found to the exact step
+NEAR_TOP_V = 3.0  # above this the pot is close to its limit: switch to fine steps
+START_V = 0.2  # after the limit, a reading below this may be the track starting again
+CONFIRM = 5  # this many smooth readings in a row confirm the track really restarted
+SMOOTH_V = 0.05  # biggest change between two fine readings that still counts as smooth
 ADC_ADDR = 0x48
 
 
@@ -47,37 +51,83 @@ print(
 print("n_motors 4 ->", send(board, "n_motors 4"))  # turn on the 4th motor
 
 bus = SMBus(1)
-steps, volts = [], []
+log = open("limits.txt", "a")  # every limit is saved here as soon as it's found
+log.write(f"\n--- sweep started {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+
+steps, volts, limits = [], [], []
+pos = 0
+near_limit = False  # True once we pass NEAR_TOP_V, until the restart has been found
+candidate = None  # step of a low reading that might be the track starting again
+smooth = 0  # smooth readings counted since that candidate
+
 try:
-    for pos in range(0, TOTAL_STEPS + 1, STEPS_PER_MOVE):
+    while True:
         v = read_volts(bus)
         steps.append(pos)
         volts.append(v)
-        print(f"step {pos:6d}   A0 = {v:.4f} V")
-        if pos < TOTAL_STEPS:
-            reply = send(board, f"mr 0 0 0 {STEPS_PER_MOVE}")  # move only motor 4
-            if reply != "done":
-                print("   Sangaboard replied:", reply)
+
+        if not near_limit:
+            near_limit = v > NEAR_TOP_V
+        elif candidate is not None and abs(v - volts[-2]) < SMOOTH_V:
+            smooth += 1
+            if smooth >= CONFIRM:  # the track really restarted at `candidate`
+                limits.append(candidate)
+                msg = f"Limit #{len(limits)} at step {candidate}"
+                if len(limits) > 1:
+                    msg += (
+                        f"   ({limits[-1] - limits[-2]} steps since the previous one)"
+                    )
+                print("\n" + msg)
+                log.write(msg + "\n")
+                log.flush()
+                near_limit, candidate = False, None
+        else:
+            # not confirmed yet: a low reading starts a new candidate, anything else resets it
+            candidate = pos if v < START_V else None
+            smooth = 0
+
+        print(
+            f"\rstep {pos:7d}   A0 = {v:.4f} V   limits found: {len(limits)}   ",
+            end="",
+            flush=True,
+        )
+
+        if pos >= TOTAL_STEPS:
+            break
+        move = FINE_STEPS if near_limit else COARSE_STEPS
+        reply = send(board, f"mr 0 0 0 {move}")  # move only motor 4
+        if reply != "done":
+            print("\n   Sangaboard replied:", reply)
+        pos += move
 except KeyboardInterrupt:
-    print("Stopped early.")
+    print("\nStopped early.")
 finally:
     send(board, "release")  # switch the motor coils off so it doesn't heat up
     board.close()
     bus.close()
 
-# Find where the voltage jumps the most between two readings: that's the wrap-around point
-plt.plot(steps, volts, ".-", markersize=3)
-if len(volts) > 1:
-    jumps = [abs(volts[i + 1] - volts[i]) for i in range(len(volts) - 1)]
-    i = jumps.index(max(jumps))
-    print(
-        f"Biggest jump: {volts[i]:.3f} V at step {steps[i]}  ->  {volts[i + 1]:.3f} V at step {steps[i + 1]}"
+# Summary: steps between consecutive limits = steps for one full turn of the pot
+print()
+gaps = [b - a for a, b in zip(limits, limits[1:])]
+if gaps:
+    summary = (
+        f"Steps per pot turn: {gaps}\n"
+        f"Average {sum(gaps) / len(gaps):.1f}, min {min(gaps)}, max {max(gaps)}"
     )
-    plt.axvline(steps[i], color="red", linestyle="--", label=f"jump at step {steps[i]}")
-    plt.legend()
+else:
+    summary = (
+        f"Limits found at steps {limits}; need at least two to measure a full turn."
+    )
+print(summary)
+log.write(summary + "\n")
+log.close()
+
+plt.plot(steps, volts, ".-", markersize=2, linewidth=0.8)
+for s in limits:
+    plt.axvline(s, color="red", linestyle="--", linewidth=0.8)
 plt.xlabel("Motor steps")
 plt.ylabel("Pot voltage on A0 (V)")
-plt.title("Pot voltage vs stepper position")
+plt.title("Pot voltage vs stepper position (red = limit)")
 plt.grid(True)
 plt.savefig("sweep.png", dpi=150)
-print("Graph saved to sweep.png")
+print("Graph saved to sweep.png, limits saved to limits.txt")
